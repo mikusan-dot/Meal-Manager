@@ -1,0 +1,9 @@
+{
+  "appId": "com.mealmanager.app",
+  "appName": "Meal Manager",
+  "webDir": "dist",
+  "backgroundColor": "#0f766e",
+  "android": {
+    "allowMixedContent": false
+  }
+}

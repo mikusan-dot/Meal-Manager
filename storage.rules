@@ -1,0 +1,39 @@
+rules_version = '2';
+
+// Receipts: managers/admins upload, every signed-in member can view.
+// Profile photos: the member themself, or staff.
+service firebase.storage {
+  match /b/{bucket}/o {
+    function signedIn() { return request.auth != null; }
+    function userPath() { return /databases/(default)/documents/users/$(request.auth.uid); }
+    function profile() { return firestore.get(userPath()).data; }
+    function hasProfile() { return signedIn() && firestore.exists(userPath()); }
+    function isAdmin() { return hasProfile() && profile().role == 'admin'; }
+    function isManagerOfMonth(month) {
+      return hasProfile()
+        && firestore.exists(/databases/(default)/documents/monthlyManagers/$(month))
+        && firestore.get(/databases/(default)/documents/monthlyManagers/$(month)).data.memberId == profile().memberId;
+    }
+    function currentMonth() {
+      let t = request.time + duration.value(6, 'h');
+      return string(t.year()) + '-' + (t.month() < 10 ? '0' : '') + string(t.month());
+    }
+    function isImage(maxBytes) {
+      return request.resource.size < maxBytes && request.resource.contentType.matches('image/.*');
+    }
+
+    match /receipts/{month}/{fileName} {
+      allow read: if hasProfile();
+      allow write: if (isAdmin() || isManagerOfMonth(month)) && isImage(5 * 1024 * 1024);
+      allow delete: if false;
+    }
+
+    match /profiles/{memberId}/{fileName} {
+      allow read: if hasProfile();
+      allow write: if hasProfile()
+                   && (profile().memberId == memberId || isAdmin() || isManagerOfMonth(currentMonth()))
+                   && isImage(2 * 1024 * 1024);
+      allow delete: if false;
+    }
+  }
+}

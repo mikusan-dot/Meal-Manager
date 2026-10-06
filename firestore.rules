@@ -1,0 +1,363 @@
+rules_version = '2';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Meal Manager – Firestore security rules
+//
+//  • Every check is enforced here; the React app hides buttons only for convenience.
+//  • Roles:   users/{uid}.role  = 'admin' | 'member'          (admin = super-admin)
+//  • Manager: monthlyManagers/{YYYY-MM}.memberId              (rotates monthly)
+//  • "canManage(month)" = admin OR that month's manager.
+//  • Financial records are never deleted; they are voided (status: 'void') while the
+//    month is open, and everything is frozen once monthlySettings/{month}.locked = true.
+//  • Meal cut-offs use Bangladesh time (UTC+6) and the server clock (request.time).
+// ─────────────────────────────────────────────────────────────────────────────
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── identity helpers ──────────────────────────────────────────────────────
+    function signedIn() { return request.auth != null; }
+    function userPath() { return /databases/$(database)/documents/users/$(request.auth.uid); }
+    function hasProfile() { return signedIn() && exists(userPath()); }
+    function isAdmin() { return hasProfile() && get(userPath()).data.role == 'admin'; }
+    function myMemberId() { return get(userPath()).data.memberId; }
+    function isSelf(memberId) { return hasProfile() && myMemberId() == memberId; }
+    function myEmail() { return request.auth.token.email.lower(); }
+
+    // ── month helpers ─────────────────────────────────────────────────────────
+    function managerPath(month) { return /databases/$(database)/documents/monthlyManagers/$(month); }
+    function settingsPath(month) { return /databases/$(database)/documents/monthlySettings/$(month); }
+    function isManagerOf(month) {
+      return hasProfile() && exists(managerPath(month)) && get(managerPath(month)).data.memberId == myMemberId();
+    }
+    function canManage(month) { return isAdmin() || isManagerOf(month); }
+    function isLocked(month) {
+      return exists(settingsPath(month)) && get(settingsPath(month)).data.get('locked', false) == true;
+    }
+    function dhakaNow() { return request.time + duration.value(6, 'h'); }
+    function two(n) { return n < 10 ? '0' + string(n) : string(n); }
+    function dhakaToday() {
+      let t = dhakaNow();
+      return string(t.year()) + '-' + two(t.month()) + '-' + two(t.day());
+    }
+    function dhakaMinutes() { let t = dhakaNow(); return t.hours() * 60 + t.minutes(); }
+    // Whoever manages the current calendar month (used for member administration)
+    function isStaffNow() {
+      let today = dhakaToday();
+      return isAdmin() || isManagerOf(today[0:7]);
+    }
+
+    // ── meal cut-off helpers ─────────────────────────────────────────────────
+    function defaultCutoff(m) { return m == 'breakfast' ? 540 : (m == 'lunch' ? 840 : 1260); }
+    function cutoff(month, m) {
+      return exists(settingsPath(month))
+        ? get(settingsPath(month)).data.get('cutoffs', {}).get(m, defaultCutoff(m))
+        : defaultCutoff(m);
+    }
+    // A meal can be edited by its owner only on future days, or today before the cut-off.
+    function mealOpen(month, date, m) {
+      return date > dhakaToday() || (date == dhakaToday() && dhakaMinutes() < cutoff(month, m));
+    }
+    function flagOk(prev, next, month, date, m) {
+      return prev[m] == next[m] || mealOpen(month, date, m);
+    }
+    function selfMealOk(prev, next, month, date) {
+      return flagOk(prev, next, month, date, 'breakfast')
+          && flagOk(prev, next, month, date, 'lunch')
+          && flagOk(prev, next, month, date, 'dinner');
+    }
+
+    function isDate(s) { return s is string && s.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$'); }
+    function isMethod(m) { return m in ['Cash', 'bKash', 'Nagad', 'Bank', 'Other']; }
+    function memberExists(id) { return exists(/databases/$(database)/documents/members/$(id)); }
+
+    // ── config (one-time bootstrap marker) ───────────────────────────────────
+    match /config/{doc} {
+      allow read: if signedIn();
+      allow create: if doc == 'bootstrap' && signedIn() && !exists(/databases/$(database)/documents/config/bootstrap)
+                    && request.resource.data.keys().hasOnly(['uid', 'createdAt'])
+                    && request.resource.data.uid == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    // ── users ────────────────────────────────────────────────────────────────
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow create: if signedIn() && request.auth.uid == uid && request.auth.token.email_verified == true && (
+        // first ever account becomes the admin (marker doc is created in the same batch)
+        ( request.resource.data.role == 'admin'
+          && !exists(/databases/$(database)/documents/config/bootstrap)
+          && getAfter(/databases/$(database)/documents/config/bootstrap).data.uid == request.auth.uid
+          && request.resource.data.keys().hasOnly(['email', 'role', 'memberId', 'createdAt']) )
+        ||
+        // everyone else claims the member profile a manager created for their email
+        ( request.resource.data.role == 'member'
+          && request.resource.data.keys().hasOnly(['email', 'role', 'memberId', 'createdAt'])
+          && get(/databases/$(database)/documents/members/$(request.resource.data.memberId)).data.email == myEmail()
+          && get(/databases/$(database)/documents/members/$(request.resource.data.memberId)).data.uid == null
+          && getAfter(/databases/$(database)/documents/members/$(request.resource.data.memberId)).data.uid == request.auth.uid )
+      );
+      // admins can promote / demote; nobody can edit their own role
+      allow update: if isAdmin() && request.auth.uid != uid
+                    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['role']);
+      allow delete: if false;
+    }
+
+    // ── members ──────────────────────────────────────────────────────────────
+    match /members/{memberId} {
+      // group members see each other (needed for transparency); a brand-new login may only look up its own email, and only once that email is verified
+      allow get, list: if hasProfile() || (signedIn() && request.auth.token.email_verified == true && resource.data.email == myEmail());
+
+      allow create: if (isStaffNow()
+                        || ( !exists(/databases/$(database)/documents/config/bootstrap)
+                             && request.resource.data.uid == request.auth.uid
+                             && getAfter(userPath()).data.role == 'admin' ))
+                    && request.resource.data.keys().hasOnly(['name', 'phone', 'email', 'roomNumber', 'photoUrl', 'joinDate', 'leaveDate', 'status', 'uid', 'createdAt', 'createdBy', 'updatedAt', 'updatedBy'])
+                    && request.resource.data.keys().hasAll(['name', 'phone', 'email', 'roomNumber', 'joinDate', 'status'])
+                    && request.resource.data.name is string && request.resource.data.name.size() > 0
+                    && request.resource.data.status in ['active', 'inactive']
+                    && isDate(request.resource.data.joinDate);
+
+      allow update:
+        // manager / admin edit (only an admin may re-link accounts)
+        if ( isStaffNow()
+             && request.resource.data.keys().hasOnly(['name', 'phone', 'email', 'roomNumber', 'photoUrl', 'joinDate', 'leaveDate', 'status', 'uid', 'createdAt', 'createdBy', 'updatedAt', 'updatedBy'])
+             && request.resource.data.status in ['active', 'inactive']
+             && isDate(request.resource.data.joinDate)
+             && (request.resource.data.get('uid', null) == resource.data.get('uid', null) || isAdmin()) )
+        // a member edits only their own phone and photo
+        || ( isSelf(memberId)
+             && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['phone', 'photoUrl', 'updatedAt', 'updatedBy']) )
+        // first login: link the account to the pre-created profile
+        || ( signedIn() && request.auth.token.email_verified == true && resource.data.email == myEmail() && resource.data.get('uid', null) == null
+             && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['uid'])
+             && request.resource.data.uid == request.auth.uid );
+
+      allow delete: if false;   // members are deactivated, never erased
+    }
+
+    // ── monthly manager rotation ─────────────────────────────────────────────
+    match /monthlyManagers/{month} {
+      allow read: if hasProfile();
+      allow create, update: if isAdmin()
+                            && month.matches('^[0-9]{4}-(0[1-9]|1[0-2])$')
+                            && request.resource.data.keys().hasOnly(['month', 'memberId', 'startDate', 'endDate', 'assignedBy', 'createdAt', 'updatedAt'])
+                            && request.resource.data.month == month
+                            && memberExists(request.resource.data.memberId)
+                            && isDate(request.resource.data.startDate) && isDate(request.resource.data.endDate)
+                            && request.resource.data.endDate >= request.resource.data.startDate
+                            && !isLocked(month);
+      allow delete: if false;
+    }
+
+    // ── per-month settings (cut-offs, guest weights, cash count, lock) ───────
+    match /monthlySettings/{month} {
+      allow read: if hasProfile();
+      allow create: if canManage(month) && month.matches('^[0-9]{4}-(0[1-9]|1[0-2])$')
+                    && request.resource.data.get('locked', false) == false
+                    && ( isAdmin() || !request.resource.data.keys().hasAny(['openingCash', 'openingBalances']) );
+      allow update:
+        // locked → only an admin may reopen, touching nothing else
+        if ( resource.data.get('locked', false) == true
+             && isAdmin()
+             && request.resource.data.locked == false
+             && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['locked', 'reopenedAt', 'reopenedBy', 'updatedAt', 'updatedBy']) )
+        // open month → manager / admin; opening balances are admin-only
+        || ( resource.data.get('locked', false) == false
+             && canManage(month)
+             && ( isAdmin() || !request.resource.data.diff(resource.data).affectedKeys().hasAny(['openingCash', 'openingBalances']) ) );
+      allow delete: if false;
+    }
+
+    // ── deposits ─────────────────────────────────────────────────────────────
+    function validDeposit(d) {
+      return d.keys().hasOnly(['memberId', 'amount', 'date', 'month', 'method', 'note', 'status', 'voidReason', 'createdAt', 'createdBy', 'updatedAt', 'updatedBy'])
+          && d.keys().hasAll(['memberId', 'amount', 'date', 'month', 'method', 'status', 'createdAt'])
+          && d.amount is number && d.amount > 0 && d.amount <= 10000000
+          && isDate(d.date) && d.month == d.date[0:7]
+          && isMethod(d.method) && d.status in ['active', 'void']
+          && memberExists(d.memberId);
+    }
+    match /deposits/{depositId} {
+      allow read: if hasProfile();
+      allow create: if canManage(request.resource.data.month) && !isLocked(request.resource.data.month)
+                    && validDeposit(request.resource.data)
+                    && depositId.matches('^DEP-[0-9]{8}-[0-9]{3,}$')
+                    && depositId[4:12] == request.resource.data.date[0:4] + request.resource.data.date[5:7] + request.resource.data.date[8:10]
+                    && request.resource.data.createdAt == request.time;
+      allow update: if canManage(resource.data.month) && !isLocked(resource.data.month) && !isLocked(request.resource.data.month)
+                    && validDeposit(request.resource.data)
+                    && request.resource.data.createdAt == resource.data.createdAt;
+      allow delete: if false;
+    }
+
+    // ── expenses (bazar) ─────────────────────────────────────────────────────
+    function validExpense(d) {
+      return d.keys().hasOnly(['itemName', 'quantity', 'unitPrice', 'totalPrice', 'date', 'month', 'vendor', 'category', 'paymentMethod', 'note', 'receiptUrl', 'receiptPath', 'status', 'voidReason', 'createdAt', 'createdBy', 'updatedAt', 'updatedBy'])
+          && d.keys().hasAll(['itemName', 'quantity', 'unitPrice', 'totalPrice', 'date', 'month', 'category', 'paymentMethod', 'status', 'createdAt'])
+          && d.itemName is string && d.itemName.size() > 0 && d.itemName.size() <= 120
+          && d.quantity is number && d.quantity > 0
+          && d.unitPrice is number && d.unitPrice > 0
+          && d.totalPrice is number && d.totalPrice > 0 && d.totalPrice <= 10000000
+          && math.abs(d.totalPrice - d.quantity * d.unitPrice) <= 0.01
+          && isDate(d.date) && d.month == d.date[0:7]
+          && d.category in ['Rice', 'Vegetables', 'Fish & Meat', 'Oil & Spices', 'Miscellaneous']
+          && isMethod(d.paymentMethod) && d.status in ['active', 'void'];
+    }
+    match /expenses/{expenseId} {
+      allow read: if hasProfile();
+      allow create: if canManage(request.resource.data.month) && !isLocked(request.resource.data.month)
+                    && validExpense(request.resource.data)
+                    && request.resource.data.createdAt == request.time;
+      allow update: if canManage(resource.data.month) && !isLocked(resource.data.month) && !isLocked(request.resource.data.month)
+                    && validExpense(request.resource.data)
+                    && request.resource.data.createdAt == resource.data.createdAt;
+      allow delete: if false;
+    }
+
+    // ── meals: one doc per member per day, id = {memberId}_{date} ────────────
+    function validMeal(d) {
+      return d.keys().hasOnly(['memberId', 'date', 'month', 'breakfast', 'lunch', 'dinner', 'updatedAt', 'updatedBy'])
+          && d.keys().hasAll(['memberId', 'date', 'month', 'breakfast', 'lunch', 'dinner', 'updatedAt'])
+          && d.breakfast is bool && d.lunch is bool && d.dinner is bool
+          && isDate(d.date) && d.month == d.date[0:7]
+          && d.updatedAt == request.time
+          && memberExists(d.memberId);
+    }
+    match /meals/{mealId} {
+      allow read: if hasProfile();
+      allow create: if validMeal(request.resource.data)
+                    && mealId == request.resource.data.memberId + '_' + request.resource.data.date
+                    && !isLocked(request.resource.data.month)
+                    && ( canManage(request.resource.data.month)
+                         || ( isSelf(request.resource.data.memberId)
+                              && selfMealOk({'breakfast': false, 'lunch': false, 'dinner': false}, request.resource.data, request.resource.data.month, request.resource.data.date) ) );
+      allow update: if validMeal(request.resource.data)
+                    && request.resource.data.memberId == resource.data.memberId
+                    && request.resource.data.date == resource.data.date
+                    && !isLocked(resource.data.month)
+                    && ( canManage(resource.data.month)
+                         || ( isSelf(resource.data.memberId)
+                              && selfMealOk(resource.data, request.resource.data, resource.data.month, resource.data.date) ) );
+      allow delete: if false;
+    }
+
+    // ── guest meals ──────────────────────────────────────────────────────────
+    function validGuest(d) {
+      return d.keys().hasOnly(['memberId', 'guestName', 'date', 'month', 'mealType', 'weight', 'createdAt', 'createdBy'])
+          && d.keys().hasAll(['memberId', 'guestName', 'date', 'month', 'mealType', 'weight', 'createdAt'])
+          && d.guestName is string && d.guestName.size() > 0 && d.guestName.size() <= 80
+          && d.mealType in ['breakfast', 'lunch', 'dinner']
+          && d.weight is number && d.weight > 0 && d.weight <= 3
+          && isDate(d.date) && d.month == d.date[0:7]
+          && d.createdAt == request.time
+          && memberExists(d.memberId);
+    }
+    match /guestMeals/{guestId} {
+      allow read: if hasProfile();
+      allow create: if validGuest(request.resource.data) && !isLocked(request.resource.data.month)
+                    && ( canManage(request.resource.data.month)
+                         || ( isSelf(request.resource.data.memberId)
+                              && mealOpen(request.resource.data.month, request.resource.data.date, request.resource.data.mealType) ) );
+      // a mistaken guest entry may be removed by its host before the cut-off, or by the manager
+      allow delete: if !isLocked(resource.data.month)
+                    && ( canManage(resource.data.month)
+                         || ( isSelf(resource.data.memberId) && mealOpen(resource.data.month, resource.data.date, resource.data.mealType) ) );
+      allow update: if false;
+    }
+
+    // ── fixed bills ──────────────────────────────────────────────────────────
+    function validBill(d) {
+      return d.keys().hasOnly(['name', 'type', 'amount', 'dueDate', 'month', 'splitMethod', 'note', 'status', 'createdAt', 'createdBy', 'updatedAt', 'updatedBy'])
+          && d.keys().hasAll(['name', 'type', 'amount', 'dueDate', 'month', 'splitMethod', 'status', 'createdAt'])
+          && d.name is string && d.name.size() > 0
+          && d.type in ['Maid', 'Gas', 'Electricity', 'Internet', 'Water', 'Other']
+          && d.amount is number && d.amount > 0
+          && isDate(d.dueDate) && d.month.matches('^[0-9]{4}-(0[1-9]|1[0-2])$')
+          && d.splitMethod in ['equal', 'days'] && d.status in ['active', 'void'];
+    }
+    match /bills/{billId} {
+      allow read: if hasProfile();
+      allow create: if canManage(request.resource.data.month) && !isLocked(request.resource.data.month)
+                    && validBill(request.resource.data) && request.resource.data.createdAt == request.time;
+      allow update: if canManage(resource.data.month) && !isLocked(resource.data.month)
+                    && request.resource.data.month == resource.data.month
+                    && validBill(request.resource.data) && request.resource.data.createdAt == resource.data.createdAt;
+      allow delete: if false;
+    }
+
+    match /billPayments/{paymentId} {
+      allow read: if hasProfile();
+      allow create, update: if canManage(request.resource.data.month) && !isLocked(request.resource.data.month)
+                    && request.resource.data.keys().hasOnly(['billId', 'memberId', 'amount', 'date', 'month', 'method', 'note', 'status', 'voidReason', 'createdAt', 'createdBy', 'updatedAt', 'updatedBy'])
+                    && request.resource.data.keys().hasAll(['billId', 'memberId', 'amount', 'date', 'month', 'method', 'status', 'createdAt'])
+                    && request.resource.data.amount is number && request.resource.data.amount > 0
+                    && isDate(request.resource.data.date) && request.resource.data.month == request.resource.data.date[0:7]
+                    && isMethod(request.resource.data.method) && request.resource.data.status in ['active', 'void']
+                    && memberExists(request.resource.data.memberId)
+                    && exists(/databases/$(database)/documents/bills/$(request.resource.data.billId))
+                    && ( request.method == 'create' || (!isLocked(resource.data.month) && request.resource.data.createdAt == resource.data.createdAt) );
+      allow delete: if false;
+    }
+
+    // ── monthly settlements: id = {month}_{memberId} ─────────────────────────
+    match /monthlySettlements/{settlementId} {
+      allow read: if hasProfile();
+      allow create, update: if canManage(request.resource.data.month) && !isLocked(request.resource.data.month)
+                    && request.resource.data.keys().hasOnly(['month', 'memberId', 'openingBalance', 'openingMeal', 'openingBill', 'deposits', 'mealCount', 'mealRate', 'mealCost', 'billShare', 'billPayments', 'mealBalance', 'billBalance', 'finalBalance', 'status', 'amount', 'generatedAt', 'generatedBy'])
+                    && settlementId == request.resource.data.month + '_' + request.resource.data.memberId
+                    && request.resource.data.finalBalance is number;
+      allow delete: if false;
+    }
+
+    // ── per-day id counters for DEP-YYYYMMDD-NNN references ──────────────────
+    match /counters/{counterId} {
+      allow read: if hasProfile();
+      allow create, update: if isStaffNow()
+                    && request.resource.data.keys().hasOnly(['n'])
+                    && request.resource.data.n is int
+                    && request.resource.data.n == (resource == null ? 1 : resource.data.n + 1);
+      allow delete: if false;
+    }
+
+    // ═════════ Phase 3 – structures are ready, UI is behind feature flags ═════════
+
+    // Audit trail: append-only. Staff write, staff read.
+    match /auditLogs/{logId} {
+      allow read: if isStaffNow();
+      allow create: if isStaffNow()
+                    && request.resource.data.actorUid == request.auth.uid
+                    && request.resource.data.createdAt == request.time
+                    && request.resource.data.keys().hasOnly(['actorUid', 'actorMemberId', 'action', 'entity', 'entityId', 'month', 'before', 'after', 'summary', 'createdAt']);
+      allow update, delete: if false;
+    }
+
+    // Notifications are generated by a backend (Cloud Function); members read and mark their own as read.
+    match /notifications/{id} {
+      allow read: if hasProfile() && (isAdmin() || resource.data.memberId == myMemberId());
+      allow create: if hasProfile()
+                    && request.resource.data.memberId == myMemberId()
+                    && request.resource.data.keys().hasOnly(['memberId', 'type', 'title', 'body', 'read', 'dedupeKey', 'createdAt', 'createdBy'])
+                    && request.resource.data.type in ['low_balance', 'deposit_due', 'bill_due', 'meal_deadline', 'large_expense']
+                    && request.resource.data.title is string && request.resource.data.body is string
+                    && request.resource.data.createdAt == request.time;
+      allow update: if hasProfile() && resource.data.memberId == myMemberId()
+                    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read', 'readAt']);
+      allow delete: if false;
+    }
+
+    // Inventory: everyone reads, staff manage.
+    match /inventory/{itemId} {
+      allow read: if hasProfile();
+      allow create, update: if isStaffNow();
+      allow delete: if false;
+    }
+
+    // Shared shopping list: any member adds; owner or staff edits.
+    match /shoppingList/{itemId} {
+      allow read: if hasProfile();
+      allow create: if hasProfile() && request.resource.data.addedBy == myMemberId();
+      allow update: if hasProfile() && (isStaffNow() || resource.data.addedBy == myMemberId());
+      allow delete: if hasProfile() && (isStaffNow() || resource.data.addedBy == myMemberId());
+    }
+  }
+}

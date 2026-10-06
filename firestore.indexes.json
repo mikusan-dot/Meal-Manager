@@ -1,0 +1,9 @@
+{
+  "indexes": [
+    { "collectionGroup": "deposits", "queryScope": "COLLECTION", "fields": [{ "fieldPath": "memberId", "order": "ASCENDING" }, { "fieldPath": "date", "order": "DESCENDING" }] },
+    { "collectionGroup": "expenses", "queryScope": "COLLECTION", "fields": [{ "fieldPath": "category", "order": "ASCENDING" }, { "fieldPath": "date", "order": "DESCENDING" }] },
+    { "collectionGroup": "auditLogs", "queryScope": "COLLECTION", "fields": [{ "fieldPath": "month", "order": "ASCENDING" }, { "fieldPath": "createdAt", "order": "DESCENDING" }] },
+    { "collectionGroup": "notifications", "queryScope": "COLLECTION", "fields": [{ "fieldPath": "memberId", "order": "ASCENDING" }, { "fieldPath": "createdAt", "order": "DESCENDING" }] }
+  ],
+  "fieldOverrides": []
+}
